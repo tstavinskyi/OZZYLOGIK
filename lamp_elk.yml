@@ -1,0 +1,554 @@
+---
+- name: Install and configure LAMP stack with MySQL dependencies in virtual environment
+  hosts: web
+  become: true
+
+  collections:
+    - community.mysql
+
+  vars:
+    mysql_root_password: "ubuntu"     
+    php_test_dir: "/var/www/php_test"
+    php_version: "8.3"               
+    venv_path: "/opt/ansible_venv"  
+
+  tasks:
+    - name: Set timezone to UTC
+      timezone:
+        name: UTC
+
+    - name: Install NTP for time synchronization
+      apt:
+        name: ntp
+        state: present
+      tags: setup
+
+    - name: Restart NTP service to apply timezone changes
+      service:
+        name: ntp
+        state: restarted
+      tags: setup
+
+    - name: Wait for apt lock to be released
+      command: sleep 30
+      retries: 10
+      delay: 10
+      register: result
+      until: result.rc == 0
+
+    - name: Update package manager and install required system packages
+      apt:
+        name:
+          - python3-dev
+          - default-libmysqlclient-dev
+          - build-essential
+          - python3-venv
+          - pkg-config
+        state: present
+      tags: setup
+
+    - name: Create a virtual environment for Ansible MySQL modules
+      command: "python3 -m venv {{ venv_path }}"
+      args:
+        creates: "{{ venv_path }}/bin/activate"
+      tags: setup
+
+    - name: Install PyMySQL in the virtual environment
+      command: "{{ venv_path }}/bin/pip install PyMySQL"
+      tags: setup
+
+    - name: Update packages and install required dependencies
+      apt:
+        update_cache: true
+
+    - name: Install Nginx, MySQL, PHP, and necessary extensions
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - nginx
+        - mysql-server
+        - "php{{ php_version }}-fpm"
+        - "php{{ php_version }}-mysql"
+
+    - name: Set MySQL root password and grant privileges
+      community.mysql.mysql_user:
+        name: root
+        host: localhost
+        password: "{{ mysql_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        priv: "*.*:ALL"
+        state: present
+        login_password: ""
+        column_case_sensitive: false    # Додано параметр column_case_sensitive
+      register: mysql_root_password_set
+      vars:
+        ansible_python_interpreter: "{{ venv_path }}/bin/python3"
+
+    - name: Create directory for the website
+      file:
+        path: "{{ php_test_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Create index.php to check PHP
+      copy:
+        dest: "{{ php_test_dir }}/index.php"
+        content: |
+          <?php phpinfo(); ?>
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Create test-connection.php to check MySQL connection
+      copy:
+        dest: "{{ php_test_dir }}/test-connection.php"
+        content: |
+          <?php
+          $servername = '127.0.0.1';
+          $username = 'root';
+          $password = '{{ mysql_root_password }}';
+
+          // Create connection
+          echo "Connecting to database...\n";
+          $conn = new mysqli($servername, $username, $password);
+
+          // Check connection
+          if ($conn->connect_error) {
+              die("Connection failed: " . $conn->connect_error);
+          }
+          echo "Connected to MySQL successfully\n";
+
+          $sql = "SELECT VERSION()";
+          $result = $conn->query($sql);
+
+          if ($result && $result->num_rows > 0) {
+              while ($row = $result->fetch_assoc()) {
+                  print_r($row);
+              }
+          } else {
+              echo "0 results";
+          }
+
+          $conn->close();
+          echo "Script completed\n";
+          ?>
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Create Nginx configuration file for the website
+      copy:
+        dest: /etc/nginx/sites-available/php_test
+        content: |
+          server {
+              listen 80;
+              server_name site1.lab.local;
+              root {{ php_test_dir }};
+
+              index index.php;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:/var/run/php/php{{ php_version }}-fpm.sock;
+              }
+
+              location ~ /\.ht {
+                  deny all;
+              }
+          }
+        mode: '0644'
+
+    - name: Create symbolic link to enable the site in Nginx
+      file:
+        src: /etc/nginx/sites-available/php_test
+        dest: /etc/nginx/sites-enabled/php_test
+        state: link
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      ignore_errors: yes
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Configure PHP socket
+      lineinfile:
+        path: "/etc/php/{{ php_version }}/cli/php.ini"
+        regexp: "^mysqli.default_socket ="
+        line: "mysqli.default_socket = /var/run/mysqld/mysqld.sock"
+        state: present
+
+    - name: Restart PHP-FPM
+      service:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+
+    - name: Restart MySQL to finalize configuration
+      service:
+        name: mysql
+        state: restarted
+
+    - name: Allow traffic on the loopback interface
+      iptables:
+        chain: INPUT
+        in_interface: lo
+        jump: ACCEPT
+        state: present
+
+    - name: Add iptables rule to allow RELATED,ESTABLISHED connections
+      iptables:
+        chain: INPUT
+        protocol: all
+        ctstate: RELATED,ESTABLISHED
+        jump: ACCEPT
+        state: present
+
+    - name: Add iptables rule to allow SSH access from specific IP
+      iptables:
+        chain: INPUT
+        source: 10.44.1.7/32
+        protocol: tcp
+        destination_port: 22
+        jump: ACCEPT
+
+    - name: Add iptables rule to allow SSH access from specific IP
+      iptables:
+        chain: INPUT
+        source: 10.44.1.250/32
+        protocol: tcp
+        destination_port: 22
+        jump: ACCEPT
+
+    - name: Add iptables rule to allow HTTP access from specific IP
+      iptables:
+        chain: INPUT
+        source: 10.44.1.4/32
+        protocol: tcp
+        destination_port: 80
+        jump: ACCEPT
+
+ 
+    - name: Add iptables rule to allow DNS access from specific IP
+      iptables:
+        chain: INPUT
+        source: 10.44.1.4/32
+        protocol: tcp
+        destination_port: 53
+        jump: ACCEPT
+
+    - name: Add iptables rule to allow ELK access from specific IP
+      iptables:
+        chain: INPUT
+        source: 10.44.10.20/32
+        protocol: tcp
+        destination_port: 5044
+        jump: ACCEPT
+
+
+    - name: Add iptables rule to log and drop all other incoming connections
+      iptables:
+        chain: INPUT
+        jump: LOG
+
+    - name: Set default policy for INPUT chain to DROP
+      iptables:
+        chain: INPUT
+        policy: DROP
+
+    # Налаштування SSH для доступу тільки за ключем
+    - name: Ensure SSH only allows key-based authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^PasswordAuthentication"
+        line: "PasswordAuthentication no"
+        state: present
+      notify: Restart ssh
+
+    # Встановити fail2ban для блокування IP після невдалих спроб входу
+    - name: Install fail2ban
+      apt:
+        name: fail2ban
+        state: present
+      tags: security
+
+    # Налаштування правил для fail2ban
+    - name: Configure fail2ban jail for sshd
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = /var/log/auth.log
+          maxretry = 5
+      notify: Restart fail2ban
+
+  handlers:
+    - name: Restart ssh
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+
+
+- name: Install and configure ELK stack with time synchronization
+  hosts: elk
+  become: true
+
+  tasks:
+    - name: Install ntpdate for time synchronization
+      apt:
+        name: ntpdate
+        state: present
+
+    - name: Synchronize system time
+      command: ntpdate -u pool.ntp.org
+
+    - name: Ensure no other apt process is running
+      shell: |
+        while fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+          echo "Waiting for other apt process to release lock..."
+          sleep 5
+        done
+
+    - name: Update and upgrade system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install apt-transport-https
+      apt:
+        name: apt-transport-https
+        state: present
+
+    - name: Add Elasticsearch GPG key
+      shell: |
+        wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | apt-key add -
+
+    - name: Add Elasticsearch repository
+      copy:
+        content: "deb https://artifacts.elastic.co/packages/8.x/apt stable main\n"
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+
+    - name: Update package index
+      apt:
+        update_cache: yes
+
+    - name: Install Elasticsearch
+      apt:
+        name: elasticsearch
+        state: present
+
+    - name: Enable and start Elasticsearch
+      systemd:
+        name: elasticsearch
+        enabled: yes
+        state: started
+
+    - name: Install Logstash
+      apt:
+        name: logstash
+        state: present
+
+    - name: Set ownership for Logstash data directory
+      file:
+        path: /usr/share/logstash/data
+        owner: logstash
+        group: logstash
+        recurse: yes
+
+    - name: Set permissions for Logstash data directory
+      file:
+        path: /usr/share/logstash/data
+        mode: '0775'
+        recurse: yes
+
+    - name: Generate Elasticsearch password for 'elastic' user
+      shell: echo "Y" | /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
+      register: reset_output
+
+    - name: Extract the new password from the output
+      set_fact:
+        elastic_password: "{{ reset_output.stdout_lines[-1].split(': ')[1] }}"
+      when: reset_output.stdout is search('New value:')
+
+    - name: Write Logstash configuration to file
+      copy:
+        dest: /etc/logstash/conf.d/logstash.conf
+        content: |
+          input {
+            beats {
+              port => 5044
+            }
+          }
+
+          output {
+            elasticsearch {
+              hosts => ["https://localhost:9200"]
+              user => "elastic"
+              password => "{{ elastic_password }}"
+              ssl_certificate_verification => false
+              index => "logs-%{+YYYY.MM.dd}"
+            }
+          }
+
+    - name: Enable and start Logstash
+      systemd:
+        name: logstash
+        enabled: yes
+        state: started
+
+    - name: Install Kibana
+      apt:
+        name: kibana
+        state: present
+
+    - name: Configure Kibana
+      lineinfile:
+        path: /etc/kibana/kibana.yml
+        line: "server.host: \"0.0.0.0\""
+        state: present
+
+    - name: Enable and start Kibana
+      systemd:
+        name: kibana
+        enabled: yes
+        state: started
+
+    - name: Wait for Kibana to be fully operational
+      pause:
+        minutes: 1
+
+    - name: Generate Kibana enrollment token
+      shell: /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+      register: kibana_token
+
+    - name: Generate Kibana verification code
+      shell: /usr/share/kibana/bin/kibana-verification-code
+      register: verification_code_output
+      failed_when: verification_code_output.rc != 0 and verification_code_output.stdout == ""
+
+    - name: Set Kibana verification code
+      set_fact:
+        kibana_verification_code: > 
+          {{ verification_code_output.stdout_lines[-1].split(': ')[1] 
+             if verification_code_output.stdout is search('Your verification code is:') 
+             else 'Verification code not found.' }}
+
+    - name: Ensure Kibana verification code is defined
+      set_fact:
+        kibana_verification_code: "{{ kibana_verification_code | default('Verification code not found.') }}"
+
+    - name: Display generated data
+      debug:
+        msg:
+          - "Elastic user password: \"{{ elastic_password }}\""
+          - "Kibana enrollment token: {{ kibana_token.stdout }}"
+          - "Kibana verification code: {{ kibana_verification_code }}"
+
+- name: Install and configure Filebeat
+  hosts: web
+  become: yes
+
+  tasks:
+    - name: Add the Elastic APT repository key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add the Elastic APT repository
+      copy:
+        content: "deb https://artifacts.elastic.co/packages/8.x/apt stable main\n"
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+
+    - name: Install Filebeat
+      apt:
+        name: filebeat
+        state: present
+
+    - name: Enable the Nginx module
+      command: filebeat modules enable nginx
+      args:
+        creates: /etc/filebeat/modules.d/nginx.yml
+
+    - name: Configure the Nginx module for Filebeat
+      copy:
+        dest: /etc/filebeat/modules.d/nginx.yml
+        content: |
+          - module: nginx
+            access:
+              enabled: true
+              var.paths: ["/var/log/nginx/access.log*"]
+            error:
+              enabled: true
+              var.paths: ["/var/log/nginx/error.log*"]
+
+    - name: Configure Filebeat to send logs to Logstash
+      copy:
+        dest: /etc/filebeat/filebeat.yml
+        content: |
+          filebeat.inputs:
+            - type: log
+              enabled: false
+
+          filebeat.config.modules:
+            path: ${path.config}/modules.d/*.yml
+            reload.enabled: false
+
+          setup.template.settings:
+            index.number_of_shards: 1
+
+          output.logstash:
+            hosts: ["10.44.10.20:5044"]
+
+          processors:
+            - add_host_metadata:
+                when.not.contains.tags: forwarded
+            - add_cloud_metadata: ~
+
+    - name: Check Filebeat configuration
+      command: filebeat test config
+      register: filebeat_config_test
+      failed_when: "'Config OK' not in filebeat_config_test.stdout"
+      ignore_errors: no
+
+    - name: Test Filebeat output
+      command: filebeat test output
+      register: filebeat_output_test
+      failed_when: "'talk to server... OK' not in filebeat_output_test.stdout"
+      ignore_errors: no
+
+    - name: Configure Filebeat to start on boot
+      systemd:
+        name: filebeat
+        enabled: yes
+        state: started
+
+    - name: Verify Filebeat service is running
+      command: systemctl is-active filebeat
+      register: filebeat_service_status
+      failed_when: "'active' not in filebeat_service_status.stdout"
+
+- name: Send notification to Slack
+  hosts: localhost
+  tasks:
+    - name: Notify Slack about the status of the playbook
+      command: python3 /etc/ansible/slack_notify.py
+
